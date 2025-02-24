@@ -106,6 +106,100 @@ EXPORT_SYMBOL(mem_map);
 #undef PRINT_PAGE_CONTENT
 int qemu_page_count = 0;
 
+/**
+ * Print the register content of x86_64 only
+ */
+void print_register_content(struct pt_regs *regs) {
+	printk(KERN_CRIT "rax: %lx, rbx: %lx, rcx: %lx, rdx: %lx\n", regs->ax, regs->bx, regs->cx, regs->dx);
+	printk(KERN_CRIT "rsi: %lx, rdi: %lx, rsp: %lx, rbp: %lx\n", regs->si, regs->di, regs->sp, regs->bp);
+	printk(KERN_CRIT "r8: %lx, r9: %lx, r10: %lx, r11: %lx\n", regs->r8, regs->r9, regs->r10, regs->r11);
+	printk(KERN_CRIT "r12: %lx, r13: %lx, r14: %lx, r15: %lx\n", regs->r12, regs->r13, regs->r14, regs->r15);
+	printk(KERN_CRIT "rip: %lx, cs: %lx, eflags: %lx, ss: %lx\n", regs->ip, regs->cs, regs->flags, regs->ss);
+	printk(KERN_CRIT "orig_rax: %lx\n", regs->orig_ax);
+}
+
+#include <linux/stacktrace.h>
+struct stacktrace_cookie {
+	unsigned long	*store;
+	unsigned int	size;
+	unsigned int	skip;
+	unsigned int	len;
+};
+struct stack_frame_user {
+	const void __user	*next_fp;
+	unsigned long		ret_addr;
+};
+
+static bool stack_trace_consume_entry(void *cookie, unsigned long addr)
+{
+	struct stacktrace_cookie *c = cookie;
+
+	if (c->len >= c->size)
+		return false;
+
+	if (c->skip > 0) {
+		c->skip--;
+		return true;
+	}
+	c->store[c->len++] = addr;
+	return c->len < c->size;
+}
+
+/**
+ * Generate user stack trace
+ */
+void arch_stack_walk_user( 
+	void *cookie, const struct pt_regs *regs) {
+	const void __user *fp = (const void __user *)regs->bp;
+
+	if (!stack_trace_consume_entry(cookie, regs->ip))
+		return;
+
+	while (1) {
+		struct stack_frame_user frame;
+
+		frame.next_fp = NULL;
+		frame.ret_addr = 0;
+		if (!copy_stack_frame(fp, &frame))
+			break;
+		if ((unsigned long)fp < regs->sp)
+			break;
+		if (!frame.ret_addr)
+			break;
+		if (!stack_trace_consume_entry(cookie, frame.ret_addr))
+			break;
+		fp = frame.next_fp;
+	}
+}
+
+void tom_stack_trace_save_user(const struct pt_regs *regs, unsigned int size)
+{
+	void *stor_array = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	unsigned long *store = stor_array;
+	stack_trace_consume_fn consume_entry = stack_trace_consume_entry;
+	struct stacktrace_cookie c = {
+		.store	= store,
+		.size	= size,
+	};
+	mm_segment_t fs;
+
+	/* Trace user stack if not a kernel thread */
+	if (current->flags & PF_KTHREAD)
+		return 0;
+
+	fs = force_uaccess_begin();
+	arch_stack_walk_user(&c, regs);
+	force_uaccess_end(fs);
+
+	// print until stor_array is empty
+	for (int i = 0; i < c.len; i++) {
+		printk(KERN_CRIT "stack_trace_save_user: %lx\n", store[i]);
+	}
+
+	kfree(stor_array);
+}
+
+
 /*
  * A number of key systems in x86 including ioremap() rely on the assumption
  * that high_memory defines the upper bound on direct map memory, then end
@@ -3474,7 +3568,7 @@ static vm_fault_t remove_device_exclusive_entry(struct vm_fault *vmf)
  * We return with the mmap_lock locked or unlocked in the same cases
  * as does filemap_fault().
  */
-vm_fault_t do_swap_page_collect(struct vm_fault *vmf, struct pt_regs *regs)
+vm_fault_t do_swap_page_collect(struct vm_fault *vmf, struct pt_regs *regs, unsigned long real_address)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct page *page = NULL, *swapcache;
@@ -3486,7 +3580,6 @@ vm_fault_t do_swap_page_collect(struct vm_fault *vmf, struct pt_regs *regs)
 	vm_fault_t ret = 0;
 	void *shadow = NULL;
 
-	// printk(KERN_CRIT "\"1. Page fault at address\", %lx\n", vmf->address);
 	if (!pte_unmap_same(vmf))
 		goto out;
 
@@ -3530,7 +3623,6 @@ vm_fault_t do_swap_page_collect(struct vm_fault *vmf, struct pt_regs *regs)
 				__SetPageLocked(page);
 				__SetPageSwapBacked(page);
 
-				// printk(KERN_CRIT "\"2. Page fault at address\", %lx\n", vmf->address);
 
 				if (mem_cgroup_swapin_charge_page(page,
 					vma->vm_mm, GFP_KERNEL, entry)) {
@@ -3692,7 +3784,11 @@ vm_fault_t do_swap_page_collect(struct vm_fault *vmf, struct pt_regs *regs)
 	/* No need to invalidate - it was non-present before */
 	update_mmu_cache(vma, vmf->address, vmf->pte);
 
-	printk(KERN_CRIT "\"%d PF addr and ip\", %lx, %lx\n", qemu_page_count, vmf->address, regs->ip);
+	// printk(KERN_CRIT "\"%d PF addr and ip and real_address\", %lx, %lx, %lx\n", qemu_page_count, vmf->address, regs->ip, real_address);
+	// Let's print the page count, real address and the whole registers with stack trace
+	printk(KERN_CRIT "%d PF real address: %lx\n", qemu_page_count, real_address);
+	print_register_content(regs);
+	dump_stack();
 	qemu_page_count++;
 
 #ifdef PRINT_PAGE_CONTENT
@@ -3716,7 +3812,6 @@ out_nomap:
 out_page:
 	unlock_page(page);
 out_release:
-	// printk(KERN_CRIT "\"3. Page fault at address\", %lx\n", vmf->address);
 
 	put_page(page);
 	if (page != swapcache && swapcache) {
@@ -3749,7 +3844,6 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	vm_fault_t ret = 0;
 	void *shadow = NULL;
 
-	// printk(KERN_CRIT "\"1. Page fault at address\", %lx\n", vmf->address);
 	if (!pte_unmap_same(vmf))
 		goto out;
 
@@ -3793,7 +3887,6 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 				__SetPageLocked(page);
 				__SetPageSwapBacked(page);
 
-				// printk(KERN_CRIT "\"2. Page fault at address\", %lx\n", vmf->address);
 
 				if (mem_cgroup_swapin_charge_page(page,
 					vma->vm_mm, GFP_KERNEL, entry)) {
@@ -3966,7 +4059,6 @@ out_nomap:
 out_page:
 	unlock_page(page);
 out_release:
-	// printk(KERN_CRIT "\"3. Page fault at address\", %lx\n", vmf->address);
 
 	put_page(page);
 	if (page != swapcache && swapcache) {
@@ -4772,11 +4864,10 @@ static vm_fault_t wp_huge_pud(struct vm_fault *vmf, pud_t orig_pud)
  * The mmap_lock may have been released depending on flags and our return value.
  * See filemap_fault() and __folio_lock_or_retry().
  */
-static vm_fault_t handle_pte_fault(struct vm_fault *vmf, struct pt_regs *regs)
+static vm_fault_t handle_pte_fault(struct vm_fault *vmf, struct pt_regs *regs, unsigned long real_address)
 {
 	pte_t entry;
 
-	// printk(KERN_CRIT "Handling pte fault at address %lx\n", vmf->address);
 
 	if (unlikely(pmd_none(*vmf->pmd))) {
 		/*
@@ -4826,7 +4917,6 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf, struct pt_regs *regs)
 	}
 
 	if (!vmf->pte) {
-		// printk(KERN_CRIT "vmf->pte is NULL, at address %lx\n", vmf->address);
 		if (vma_is_anonymous(vmf->vma))
 			return do_anonymous_page(vmf);
 		else
@@ -4834,14 +4924,12 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf, struct pt_regs *regs)
 	}
 
 	if (!pte_present(vmf->orig_pte))
-		return do_swap_page_collect(vmf, regs);
+		return do_swap_page_collect(vmf, regs, real_address);
 
-	// printk(KERN_CRIT "Did not do swap at address %lx\n", vmf->address);
 
 	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma))
 		return do_numa_page(vmf);
 
-	// printk(KERN_CRIT "Did not do numa at address %lx\n", vmf->address);
 
 	vmf->ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
 	spin_lock(vmf->ptl);
@@ -4969,7 +5057,7 @@ retry_pud:
 		}
 	}
 
-	return handle_pte_fault(&vmf, regs);
+	return handle_pte_fault(&vmf, regs, address);
 }
 
 /**
