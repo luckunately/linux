@@ -144,11 +144,29 @@ static bool stack_trace_consume_entry(void *cookie, unsigned long addr)
 	c->store[c->len++] = addr;
 	return c->len < c->size;
 }
+static int
+copy_stack_frame(const struct stack_frame_user __user *fp,
+		 struct stack_frame_user *frame)
+{
+	int ret;
+
+	if (__range_not_ok(fp, sizeof(*frame), TASK_SIZE))
+		return 0;
+
+	ret = 1;
+	pagefault_disable();
+	if (__get_user(frame->next_fp, &fp->next_fp) ||
+	    __get_user(frame->ret_addr, &fp->ret_addr))
+		ret = 0;
+	pagefault_enable();
+
+	return ret;
+}
 
 /**
  * Generate user stack trace
  */
-void arch_stack_walk_user( 
+void tom_arch_stack_walk_user( 
 	void *cookie, const struct pt_regs *regs) {
 	const void __user *fp = (const void __user *)regs->bp;
 
@@ -185,14 +203,15 @@ void tom_stack_trace_save_user(const struct pt_regs *regs, unsigned int size)
 
 	/* Trace user stack if not a kernel thread */
 	if (current->flags & PF_KTHREAD)
-		return 0;
+		return ;
 
 	fs = force_uaccess_begin();
-	arch_stack_walk_user(&c, regs);
+	tom_arch_stack_walk_user(&c, regs);
 	force_uaccess_end(fs);
 
 	// print until stor_array is empty
-	for (int i = 0; i < c.len; i++) {
+	int i;
+	for (i = 0; i < c.len; i++) {
 		printk(KERN_CRIT "stack_trace_save_user: %lx\n", store[i]);
 	}
 
@@ -3788,7 +3807,7 @@ vm_fault_t do_swap_page_collect(struct vm_fault *vmf, struct pt_regs *regs, unsi
 	// Let's print the page count, real address and the whole registers with stack trace
 	printk(KERN_CRIT "%d PF real address: %lx\n", qemu_page_count, real_address);
 	print_register_content(regs);
-	dump_stack();
+	tom_stack_trace_save_user(regs, 8);
 	qemu_page_count++;
 
 #ifdef PRINT_PAGE_CONTENT
